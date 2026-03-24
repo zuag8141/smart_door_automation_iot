@@ -111,12 +111,14 @@ void resetNewPass() {
 }
 
 void showRFIDMenu() {
-  showLine0("RFID MENU");
-  clearLine(1);
-  lcd.setCursor(0, 1);
-  lcd.print("1:Add 2:Del [");
+  clearLine(0);
+  lcd.setCursor(0, 0);
+  lcd.print("RFID [");
   lcd.print(cardCount);
   lcd.print("/5]");
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print("1:Add  2:Delete");
 }
 
 int findCardIndex(byte uid[4]) {
@@ -222,9 +224,14 @@ void closeDoor() {
 
 void checkPresence() {
 
-  if (state == SYS_DOOR_OPEN) return;
-
   updateDistance();
+
+  if (state == SYS_DOOR_OPEN) {
+    if (distance < PERSON_DISTANCE) {
+      lastSeen = millis();
+    }
+    return;
+  }
 
   if (distance < PERSON_DISTANCE) {
 
@@ -253,7 +260,10 @@ void checkPresence() {
 
 void checkDoorTimer() {
   if (state != SYS_DOOR_OPEN) return;
-  if (millis() - doorTimer > DOOR_TIMEOUT) closeDoor();
+  
+  if (distance >= PERSON_DISTANCE && millis() - lastSeen > DOOR_TIMEOUT) {
+    closeDoor();
+  }
 }
 
 void checkKeypad() {
