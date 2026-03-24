@@ -164,6 +164,9 @@ void openDoor() {
 
   doorTimer = millis();
   state = SYS_DOOR_OPEN;
+  authMode = AUTH_ENTER_PASS;
+  resetInput();
+  resetNewPass();
 }
 
 void closeDoor() {
@@ -205,6 +208,7 @@ void checkPresence() {
     if (state == SYS_AUTH && millis() - lastSeen > PRESENCE_TIMEOUT) {
       state = SYS_IDLE;
       authMode = AUTH_ENTER_PASS;
+      showLine0("Door CLOSED");
       showWaiting();
       resetInput();
       resetNewPass();
@@ -264,6 +268,12 @@ void checkKeypad() {
 
     if (key == '#') {
 
+      if (inputIndex < PASS_MIN) {
+        resetInput();
+        showPassword();
+        return;
+      }
+
       inputPass[inputIndex] = '\0';
 
       if (strcmp(inputPass, password) == 0) openDoor();
@@ -320,6 +330,16 @@ void checkKeypad() {
     }
 
     if (key == '*') {
+      if (newIndex < PASS_MIN) {
+        clearLine(1);
+        lcd.setCursor(0, 1);
+        lcd.print("Enter pass first");
+        delay(800);
+        clearLine(1);
+        lcd.setCursor(0, 1);
+        lcd.print("New Pass (*RFID)");
+        return;
+      }
       authMode = AUTH_RFID_MENU;
       showRFIDMenu();
     }
@@ -362,6 +382,7 @@ void checkKeypad() {
 void checkRFID() {
 
   if (state != SYS_AUTH) return;
+  if (authMode == AUTH_CHANGE_PASS) return;
 
   if (!rfid.PICC_IsNewCardPresent()) return;
   if (!rfid.PICC_ReadCardSerial()) return;
@@ -376,8 +397,12 @@ void checkRFID() {
 
     delay(1000);
 
-    authMode = AUTH_RFID_MENU;
-    showRFIDMenu();
+    authMode = AUTH_ENTER_PASS;
+    state = SYS_IDLE;
+    showLine0("Door CLOSED");
+    showWaiting();
+    resetInput();
+    resetNewPass();
 
   } else if (authMode == AUTH_RFID_DELETE_SCAN) {
 
@@ -393,8 +418,12 @@ void checkRFID() {
 
     delay(1000);
 
-    authMode = AUTH_RFID_MENU;
-    showRFIDMenu();
+    authMode = AUTH_ENTER_PASS;
+    state = SYS_IDLE;
+    showLine0("Door CLOSED");
+    showWaiting();
+    resetInput();
+    resetNewPass();
 
   } else {
 
@@ -424,8 +453,17 @@ void checkBluetooth() {
   String command = Serial.readStringUntil('\n');
   command.trim();
 
-  if ((command == "SWITCH1_ON" || command == "SWITCH1_OFF") && state != SYS_DOOR_OPEN) openDoor();
-  if ((command == "SWITCH2_ON" || command == "SWITCH2_OFF") && state == SYS_DOOR_OPEN) closeDoor();
+  if (command == "SWITCH1_ON" || command == "SWITCH1_OFF") {
+    if (state != SYS_DOOR_OPEN) {
+      openDoor();
+      Serial.println("OK_OPEN");
+    }
+  } else if (command == "SWITCH2_ON" || command == "SWITCH2_OFF") {
+    if (state == SYS_DOOR_OPEN) {
+      closeDoor();
+      Serial.println("OK_CLOSE");
+    }
+  }
 }
 
 void checkInsideButton() {
@@ -439,8 +477,11 @@ void checkInsideButton() {
 
     lastPress = millis();
 
-    if (state == SYS_DOOR_OPEN) closeDoor();
-    else openDoor();
+    if (state == SYS_DOOR_OPEN) {
+      closeDoor();
+    } else {
+      openDoor();
+    }
   }
 
   lastState = s;
@@ -459,6 +500,8 @@ void setup() {
 
   doorServo.attach(SERVO_PIN);
   doorServo.write(LOCK_POS);
+  delay(500);
+  doorServo.detach();
 
   lcd.init();
   lcd.backlight();
