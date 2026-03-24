@@ -5,6 +5,7 @@
 #include <MFRC522.h>
 #include <Servo.h>
 #include <EEPROM.h>
+#include <string.h>
 
 #define SERVO_PIN 8
 #define TRIG 2
@@ -18,7 +19,7 @@
 
 #define PERSON_DISTANCE 10
 #define DOOR_TIMEOUT 3000
-#define PRESENCE_TIMEOUT 3000
+#define INTERFACE_IDLE_TIMEOUT 45000
 
 #define PASS_MIN 4
 #define PASS_MAX 6
@@ -28,6 +29,10 @@
 #define EEPROM_RFID_COUNT_ADDR (EEPROM_PASS_DATA_ADDR + PASS_MAX)
 #define EEPROM_RFID_DATA_ADDR (EEPROM_RFID_COUNT_ADDR + 1)
 #define RFID_UID_SIZE 4
+#define RECOVERY_TRIGGER "*#*#"
+#define RECOVERY_WINDOW 60000UL
+#define RECOVERY_MAX_ATTEMPTS 3
+#define RECOVERY_LOCKOUT 300000UL
 
 #define MAX_RFID_CARDS 5
 
@@ -46,7 +51,9 @@ enum AuthMode {
   AUTH_CHANGE_PASS,
   AUTH_RFID_MENU,
   AUTH_RFID_ADD_SCAN,
-  AUTH_RFID_DELETE_SCAN
+  AUTH_RFID_DELETE_SCAN,
+  AUTH_RECOVERY_OTP,
+  AUTH_RECOVERY_SET_PASS
 };
 
 SystemState state = SYS_IDLE;
@@ -55,11 +62,12 @@ AuthMode authMode = AUTH_ENTER_PASS;
 char password[7] = "0000";
 char inputPass[7];
 char newPass[7];
+char recoveryOtpInput[7];
 
 byte inputIndex = 0;
 byte newIndex = 0;
+byte recoveryOtpIndex = 0;
 
-unsigned long doorTimer = 0;
 unsigned long lastSeen = 0;
 unsigned long lastSensorRead = 0;
 
@@ -67,6 +75,12 @@ long distance = 999;
 
 byte allowedUIDs[MAX_RFID_CARDS][4];
 byte cardCount = 0;
+unsigned long recoveryExpiresAt = 0;
+unsigned long recoveryLockoutUntil = 0;
+byte recoveryAttempts = 0;
+bool recoveryPendingOtp = false;
+bool recoveryCanSetPass = false;
+char recoveryOtp[7] = "";
 
 const byte ROWS = 4;
 const byte COLS = 3;
@@ -106,6 +120,27 @@ void showPassword() {
   lcd.print("Password: ");
 }
 
+void restoreDoorStatusUI() {
+  if (state == SYS_DOOR_OPEN) {
+    showLine0("Door OPEN");
+    clearLine(1);
+    return;
+  }
+
+  showLine0("Door CLOSED");
+  if (state == SYS_AUTH) showPassword();
+  else showWaiting();
+}
+
+void showRecoveryNoticeThenRestore(const char* title, const char* detail, unsigned int ms) {
+  showLine0(title);
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print(detail);
+  delay(ms);
+  restoreDoorStatusUI();
+}
+
 void resetInput() {
   inputIndex = 0;
   memset(inputPass, 0, sizeof(inputPass));
@@ -114,6 +149,72 @@ void resetInput() {
 void resetNewPass() {
   newIndex = 0;
   memset(newPass, 0, sizeof(newPass));
+}
+
+void resetRecoveryOtpInput() {
+  recoveryOtpIndex = 0;
+  memset(recoveryOtpInput, 0, sizeof(recoveryOtpInput));
+}
+
+void showRecoveryOtpInput() {
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print("OTP: ");
+  for (byte i = 0; i < recoveryOtpIndex; i++) {
+    lcd.print("*");
+  }
+}
+
+void showRecoveryNewPassInput() {
+  clearLine(1);
+  lcd.setCursor(0, 1);
+  lcd.print("NEW: ");
+  for (byte i = 0; i < newIndex; i++) {
+    lcd.print("*");
+  }
+}
+
+void clearRecoveryState() {
+  recoveryPendingOtp = false;
+  recoveryCanSetPass = false;
+  recoveryExpiresAt = 0;
+  memset(recoveryOtp, 0, sizeof(recoveryOtp));
+  resetRecoveryOtpInput();
+}
+
+bool isDigitsOnlyCStr(const char* value) {
+  if (!value || value[0] == '\0') return false;
+  for (byte i = 0; value[i] != '\0'; i++) {
+    if (!isDigit(value[i])) return false;
+  }
+  return true;
+}
+
+void generateRecoveryOtp() {
+  long value = random(100000, 1000000);
+  snprintf(recoveryOtp, sizeof(recoveryOtp), "%06ld", value);
+}
+
+void tryStartRecoveryByKeypad() {
+  if (millis() < recoveryLockoutUntil) {
+    showLine0("Recovery Locked");
+    clearLine(1);
+    lcd.setCursor(0, 1);
+    lcd.print("Try later...");
+    return;
+  }
+
+  recoveryPendingOtp = true;
+  recoveryCanSetPass = false;
+  authMode = AUTH_RECOVERY_OTP;
+  recoveryExpiresAt = millis() + RECOVERY_WINDOW;
+  recoveryAttempts = 0;
+  generateRecoveryOtp();
+  resetRecoveryOtpInput();
+
+  showLine0("Enter OTP");
+  showRecoveryOtpInput();
+  Serial.println(recoveryOtp);
 }
 
 bool isValidPassLength(byte len) {
@@ -271,7 +372,7 @@ void openDoor() {
 
   Serial.print("DOOR OPEN");
 
-  doorTimer = millis();
+  lastSeen = millis();
   state = SYS_DOOR_OPEN;
   authMode = AUTH_ENTER_PASS;
   resetInput();
@@ -319,7 +420,7 @@ void checkPresence() {
 
   } else {
 
-    if (state == SYS_AUTH && authMode == AUTH_ENTER_PASS && millis() - lastSeen > PRESENCE_TIMEOUT) {
+    if (state == SYS_AUTH && millis() - lastSeen > INTERFACE_IDLE_TIMEOUT) {
       state = SYS_IDLE;
       authMode = AUTH_ENTER_PASS;
       showLine0("Door CLOSED");
@@ -344,6 +445,146 @@ void checkKeypad() {
 
   char key = keypad.getKey();
   if (!key) return;
+
+  if ((recoveryPendingOtp || recoveryCanSetPass) && millis() > recoveryExpiresAt) {
+    clearRecoveryState();
+    authMode = AUTH_ENTER_PASS;
+    showRecoveryNoticeThenRestore("Recovery Timeout", "Try again", 700);
+    return;
+  }
+
+  if (authMode == AUTH_ENTER_PASS) {
+    static const char trigger[] = RECOVERY_TRIGGER;
+    static byte triggerIndex = 0;
+
+    if (key == trigger[triggerIndex]) {
+      triggerIndex++;
+      if (trigger[triggerIndex] == '\0') {
+        triggerIndex = 0;
+        resetInput();
+        tryStartRecoveryByKeypad();
+        return;
+      }
+    } else {
+      triggerIndex = (key == trigger[0]) ? 1 : 0;
+    }
+  }
+
+  if (authMode == AUTH_RECOVERY_OTP) {
+    static bool starCancelArmedOtp = false;
+
+    if (key == '*') {
+      if (starCancelArmedOtp) {
+        starCancelArmedOtp = false;
+        clearRecoveryState();
+        authMode = AUTH_ENTER_PASS;
+        showRecoveryNoticeThenRestore("Recovery Canceled", "Back to normal", 700);
+        return;
+      }
+      starCancelArmedOtp = true;
+      resetRecoveryOtpInput();
+      showRecoveryOtpInput();
+      return;
+    }
+
+    starCancelArmedOtp = false;
+
+    if (isDigit(key) && recoveryOtpIndex < 6) {
+      recoveryOtpInput[recoveryOtpIndex++] = key;
+      showRecoveryOtpInput();
+    }
+
+    if (key == '#') {
+      if (recoveryOtpIndex != 6) {
+        clearLine(1);
+        lcd.setCursor(0, 1);
+        lcd.print("Need 6 digits");
+        delay(700);
+        resetRecoveryOtpInput();
+        showRecoveryOtpInput();
+        return;
+      }
+
+      recoveryOtpInput[recoveryOtpIndex] = '\0';
+      if (strcmp(recoveryOtpInput, recoveryOtp) == 0) {
+        recoveryPendingOtp = false;
+        recoveryCanSetPass = true;
+        recoveryExpiresAt = millis() + RECOVERY_WINDOW;
+        recoveryAttempts = 0;
+        authMode = AUTH_RECOVERY_SET_PASS;
+        resetRecoveryOtpInput();
+        resetNewPass();
+        showLine0("New Pass");
+        showRecoveryNewPassInput();
+        Serial.println("OK_RECOVER");
+      } else {
+        recoveryAttempts++;
+        Serial.println("ERR_OTP");
+        if (recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
+          recoveryLockoutUntil = millis() + RECOVERY_LOCKOUT;
+          clearRecoveryState();
+          authMode = AUTH_ENTER_PASS;
+          showRecoveryNoticeThenRestore("Recovery Locked", "Too many tries", 900);
+        } else {
+          clearLine(1);
+          lcd.setCursor(0, 1);
+          lcd.print("Wrong OTP");
+          delay(700);
+          resetRecoveryOtpInput();
+          showRecoveryOtpInput();
+        }
+      }
+    }
+    return;
+  }
+
+  if (authMode == AUTH_RECOVERY_SET_PASS) {
+    static bool starCancelArmedPass = false;
+
+    if (key == '*') {
+      if (starCancelArmedPass) {
+        starCancelArmedPass = false;
+        clearRecoveryState();
+        authMode = AUTH_ENTER_PASS;
+        showRecoveryNoticeThenRestore("Recovery Canceled", "Back to normal", 700);
+        return;
+      }
+      starCancelArmedPass = true;
+      resetNewPass();
+      showRecoveryNewPassInput();
+      return;
+    }
+
+    starCancelArmedPass = false;
+
+    if (isDigit(key) && newIndex < PASS_MAX) {
+      newPass[newIndex++] = key;
+      showRecoveryNewPassInput();
+    }
+
+    if (key == '#') {
+      if (newIndex < PASS_MIN) {
+        clearLine(1);
+        lcd.setCursor(0, 1);
+        lcd.print("Too Short");
+        delay(700);
+        resetNewPass();
+        showRecoveryNewPassInput();
+        return;
+      }
+
+      newPass[newIndex] = '\0';
+      strcpy(password, newPass);
+      savePasswordToEEPROM();
+      clearRecoveryState();
+      authMode = AUTH_ENTER_PASS;
+      resetInput();
+      resetNewPass();
+      showRecoveryNoticeThenRestore("Pass Recovered", "Saved", 700);
+      Serial.println("OK_PASS_CHANGED");
+    }
+    return;
+  }
 
   if (authMode == AUTH_ENTER_PASS) {
 
@@ -491,7 +732,7 @@ void checkKeypad() {
 void checkRFID() {
 
   if (state != SYS_AUTH) return;
-  if (authMode == AUTH_CHANGE_PASS) return;
+  if (authMode == AUTH_CHANGE_PASS || authMode == AUTH_RECOVERY_OTP || authMode == AUTH_RECOVERY_SET_PASS) return;
 
   if (!rfid.PICC_IsNewCardPresent()) return;
   if (!rfid.PICC_ReadCardSerial()) return;
@@ -553,6 +794,13 @@ void checkRFID() {
     resetInput();
     resetNewPass();
 
+  } else if (authMode == AUTH_RFID_MENU) {
+    clearLine(1);
+    lcd.setCursor(0, 1);
+    lcd.print("Pick 1:Add 2:Del");
+    delay(800);
+    showRFIDMenu();
+
   } else {
 
     if (currentCardMatchesAllowed()) {
@@ -578,18 +826,113 @@ void checkBluetooth() {
 
   if (!Serial.available()) return;
 
-  String command = Serial.readStringUntil('\n');
-  command.trim();
+  static char command[32];
+  byte idx = 0;
+  while (Serial.available() && idx < sizeof(command) - 1) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (idx == 0) continue;
+      break;
+    }
+    command[idx++] = c;
+  }
+  command[idx] = '\0';
+  if (idx == 0) return;
 
-  if (command == "SWITCH1_ON" || command == "SWITCH1_OFF") {
-    if (state != SYS_DOOR_OPEN) {
+  if ((recoveryPendingOtp || recoveryCanSetPass) && millis() > recoveryExpiresAt) {
+    clearRecoveryState();
+    Serial.println("ERR_RECOVER_TIMEOUT");
+    showRecoveryNoticeThenRestore("Recovery Timeout", "Try again", 700);
+  }
+
+  if (strcmp(command, "OTP_REQ") == 0 || strcmp(command, "OTP_REQUEST") == 0 || strcmp(command, "SEND_OTP") == 0) {
+    if (!recoveryPendingOtp) {
+      Serial.println("ERR_OTP_REQ_STATE");
+      return;
+    }
+    if (millis() < recoveryLockoutUntil) {
+      clearRecoveryState();
+      Serial.println("ERR_RECOVER_LOCKED");
+      return;
+    }
+    Serial.println(recoveryOtp);
+    return;
+  }
+
+  if (strncmp(command, "RECOVER_OTP:", 12) == 0) {
+    if (!recoveryPendingOtp) {
+      Serial.println("ERR_RECOVER_STATE");
+      return;
+    }
+
+    if (millis() < recoveryLockoutUntil) {
+      clearRecoveryState();
+      Serial.println("ERR_RECOVER_LOCKED");
+      return;
+    }
+
+    const char* otp = command + 12;
+    if (strcmp(otp, recoveryOtp) == 0) {
+      recoveryPendingOtp = false;
+      recoveryCanSetPass = true;
+      recoveryExpiresAt = millis() + RECOVERY_WINDOW;
+      recoveryAttempts = 0;
+      Serial.println("OK_RECOVER");
+      showLine0("OTP Verified");
+      clearLine(1);
+      lcd.setCursor(0, 1);
+      lcd.print("Send SET_PASS");
+    } else {
+      recoveryAttempts++;
+      Serial.println("ERR_OTP");
+      if (recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
+        recoveryLockoutUntil = millis() + RECOVERY_LOCKOUT;
+        clearRecoveryState();
+        showRecoveryNoticeThenRestore("Recovery Locked", "Too many tries", 900);
+      }
+    }
+    return;
+  }
+
+  if (strncmp(command, "SET_PASS:", 9) == 0) {
+    if (!recoveryCanSetPass || millis() > recoveryExpiresAt) {
+      clearRecoveryState();
+      Serial.println("ERR_SET_PASS_STATE");
+      return;
+    }
+
+    const char* nextPass = command + 9;
+    byte nextPassLen = (byte)strlen(nextPass);
+    if (!isDigitsOnlyCStr(nextPass) || !isValidPassLength(nextPassLen)) {
+      Serial.println("ERR_SET_PASS_FORMAT");
+      return;
+    }
+
+    strncpy(password, nextPass, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    savePasswordToEEPROM();
+    clearRecoveryState();
+    resetInput();
+    resetNewPass();
+
+    showRecoveryNoticeThenRestore("Pass Recovered", "Saved", 700);
+    Serial.println("OK_PASS_CHANGED");
+    return;
+  }
+
+  if (strcmp(command, "SWITCH1_ON") == 0 || strcmp(command, "SWITCH1_OFF") == 0) {
+    if (state == SYS_AUTH) {
       openDoor();
       Serial.println("OK_OPEN");
+    } else {
+      Serial.println("ERR_SLEEP");
     }
-  } else if (command == "SWITCH2_ON" || command == "SWITCH2_OFF") {
+  } else if (strcmp(command, "SWITCH2_ON") == 0 || strcmp(command, "SWITCH2_OFF") == 0) {
     if (state == SYS_DOOR_OPEN) {
       closeDoor();
       Serial.println("OK_CLOSE");
+    } else {
+      Serial.println("ERR_NOT_OPEN");
     }
   }
 }
@@ -618,6 +961,7 @@ void checkInsideButton() {
 void setup() {
 
   Serial.begin(9600);
+  randomSeed(analogRead(A5) ^ millis());
   loadPasswordFromEEPROM();
   loadRFIDFromEEPROM();
 
