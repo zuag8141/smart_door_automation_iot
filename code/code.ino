@@ -23,6 +23,8 @@
 #define PASS_MAX 6
 #define PASS_POS 9
 
+#define MAX_RFID_CARDS 5
+
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 Servo doorServo;
 MFRC522 rfid(SS_PIN, RST_PIN);
@@ -57,8 +59,8 @@ unsigned long lastSensorRead = 0;
 
 long distance = 999;
 
-byte allowedUID[4] = { 0x0E, 0xD1, 0x44, 0x02 };
-bool hasAllowedUID = true;
+byte allowedUIDs[MAX_RFID_CARDS][4];
+byte cardCount = 0;
 
 const byte ROWS = 4;
 const byte COLS = 3;
@@ -112,23 +114,56 @@ void showRFIDMenu() {
   showLine0("RFID MENU");
   clearLine(1);
   lcd.setCursor(0, 1);
-  lcd.print("1:Add 2:Delete");
+  lcd.print("1:Add 2:Del [");
+  lcd.print(cardCount);
+  lcd.print("/5]");
+}
+
+int findCardIndex(byte uid[4]) {
+  for (byte i = 0; i < cardCount; i++) {
+    bool match = true;
+    for (byte j = 0; j < 4; j++) {
+      if (allowedUIDs[i][j] != uid[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return i;
+  }
+  return -1;
 }
 
 bool currentCardMatchesAllowed() {
-  if (!hasAllowedUID || rfid.uid.size < 4) return false;
-  for (byte i = 0; i < 4; i++) {
-    if (rfid.uid.uidByte[i] != allowedUID[i]) return false;
-  }
-  return true;
+  if (cardCount == 0 || rfid.uid.size < 4) return false;
+  return findCardIndex(rfid.uid.uidByte) >= 0;
 }
 
 void saveCurrentCardAsAllowed() {
   if (rfid.uid.size < 4) return;
+  
+  int existingIndex = findCardIndex(rfid.uid.uidByte);
+  if (existingIndex >= 0) return;
+  
+  if (cardCount >= MAX_RFID_CARDS) return;
+  
   for (byte i = 0; i < 4; i++) {
-    allowedUID[i] = rfid.uid.uidByte[i];
+    allowedUIDs[cardCount][i] = rfid.uid.uidByte[i];
   }
-  hasAllowedUID = true;
+  cardCount++;
+}
+
+void deleteCurrentCard() {
+  if (rfid.uid.size < 4 || cardCount == 0) return;
+  
+  int index = findCardIndex(rfid.uid.uidByte);
+  if (index < 0) return;
+  
+  for (byte i = index; i < cardCount - 1; i++) {
+    for (byte j = 0; j < 4; j++) {
+      allowedUIDs[i][j] = allowedUIDs[i + 1][j];
+    }
+  }
+  cardCount--;
 }
 
 long readUltrasonic() {
@@ -205,7 +240,7 @@ void checkPresence() {
 
   } else {
 
-    if (state == SYS_AUTH && millis() - lastSeen > PRESENCE_TIMEOUT) {
+    if (state == SYS_AUTH && authMode == AUTH_ENTER_PASS && millis() - lastSeen > PRESENCE_TIMEOUT) {
       state = SYS_IDLE;
       authMode = AUTH_ENTER_PASS;
       showLine0("Door CLOSED");
@@ -330,18 +365,9 @@ void checkKeypad() {
     }
 
     if (key == '*') {
-      if (newIndex < PASS_MIN) {
-        clearLine(1);
-        lcd.setCursor(0, 1);
-        lcd.print("Enter pass first");
-        delay(800);
-        clearLine(1);
-        lcd.setCursor(0, 1);
-        lcd.print("New Pass (*RFID)");
-        return;
-      }
       authMode = AUTH_RFID_MENU;
       showRFIDMenu();
+      resetNewPass();
     }
 
   } else if (authMode == AUTH_RFID_MENU) {
@@ -389,13 +415,27 @@ void checkRFID() {
 
   if (authMode == AUTH_RFID_ADD_SCAN) {
 
-    saveCurrentCardAsAllowed();
-
-    clearLine(1);
-    lcd.setCursor(0, 1);
-    lcd.print("RFID Added");
-
-    delay(1000);
+    int existingIdx = findCardIndex(rfid.uid.uidByte);
+    
+    if (existingIdx >= 0) {
+      clearLine(1);
+      lcd.setCursor(0, 1);
+      lcd.print("Already exists!");
+      delay(1000);
+    } else if (cardCount >= MAX_RFID_CARDS) {
+      clearLine(1);
+      lcd.setCursor(0, 1);
+      lcd.print("Memory full!");
+      delay(1000);
+    } else {
+      saveCurrentCardAsAllowed();
+      clearLine(1);
+      lcd.setCursor(0, 1);
+      lcd.print("RFID Added [");
+      lcd.print(cardCount);
+      lcd.print("/5]");
+      delay(1000);
+    }
 
     authMode = AUTH_ENTER_PASS;
     state = SYS_IDLE;
@@ -409,11 +449,14 @@ void checkRFID() {
     clearLine(1);
     lcd.setCursor(0, 1);
 
-    if (currentCardMatchesAllowed()) {
-      hasAllowedUID = false;
-      lcd.print("RFID Deleted");
+    int idx = findCardIndex(rfid.uid.uidByte);
+    if (idx >= 0) {
+      deleteCurrentCard();
+      lcd.print("Deleted [");
+      lcd.print(cardCount);
+      lcd.print("/5]");
     } else {
-      lcd.print("RFID Not Found");
+      lcd.print("Not Found");
     }
 
     delay(1000);
