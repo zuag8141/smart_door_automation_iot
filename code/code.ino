@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Servo.h>
+#include <EEPROM.h>
 
 #define SERVO_PIN 8
 #define TRIG 2
@@ -22,6 +23,11 @@
 #define PASS_MIN 4
 #define PASS_MAX 6
 #define PASS_POS 9
+#define EEPROM_PASS_LEN_ADDR 0
+#define EEPROM_PASS_DATA_ADDR 1
+#define EEPROM_RFID_COUNT_ADDR (EEPROM_PASS_DATA_ADDR + PASS_MAX)
+#define EEPROM_RFID_DATA_ADDR (EEPROM_RFID_COUNT_ADDR + 1)
+#define RFID_UID_SIZE 4
 
 #define MAX_RFID_CARDS 5
 
@@ -108,6 +114,72 @@ void resetInput() {
 void resetNewPass() {
   newIndex = 0;
   memset(newPass, 0, sizeof(newPass));
+}
+
+bool isValidPassLength(byte len) {
+  return len >= PASS_MIN && len <= PASS_MAX;
+}
+
+void loadPasswordFromEEPROM() {
+  byte storedLen = EEPROM.read(EEPROM_PASS_LEN_ADDR);
+  if (!isValidPassLength(storedLen)) {
+    strcpy(password, "0000");
+    return;
+  }
+
+  for (byte i = 0; i < storedLen; i++) {
+    char c = (char)EEPROM.read(EEPROM_PASS_DATA_ADDR + i);
+    if (!isDigit(c)) {
+      strcpy(password, "0000");
+      return;
+    }
+    password[i] = c;
+  }
+
+  password[storedLen] = '\0';
+}
+
+void savePasswordToEEPROM() {
+  byte len = strlen(password);
+  if (!isValidPassLength(len)) return;
+
+  EEPROM.update(EEPROM_PASS_LEN_ADDR, len);
+  for (byte i = 0; i < PASS_MAX; i++) {
+    byte value = (i < len) ? (byte)password[i] : 0;
+    EEPROM.update(EEPROM_PASS_DATA_ADDR + i, value);
+  }
+}
+
+void loadRFIDFromEEPROM() {
+  byte storedCount = EEPROM.read(EEPROM_RFID_COUNT_ADDR);
+  if (storedCount > MAX_RFID_CARDS) {
+    cardCount = 0;
+    memset(allowedUIDs, 0, sizeof(allowedUIDs));
+    return;
+  }
+
+  cardCount = storedCount;
+  for (byte i = 0; i < cardCount; i++) {
+    for (byte j = 0; j < RFID_UID_SIZE; j++) {
+      allowedUIDs[i][j] = EEPROM.read(EEPROM_RFID_DATA_ADDR + (i * RFID_UID_SIZE) + j);
+    }
+  }
+
+  for (byte i = cardCount; i < MAX_RFID_CARDS; i++) {
+    for (byte j = 0; j < RFID_UID_SIZE; j++) {
+      allowedUIDs[i][j] = 0;
+    }
+  }
+}
+
+void saveRFIDToEEPROM() {
+  EEPROM.update(EEPROM_RFID_COUNT_ADDR, cardCount);
+  for (byte i = 0; i < MAX_RFID_CARDS; i++) {
+    for (byte j = 0; j < RFID_UID_SIZE; j++) {
+      byte value = (i < cardCount) ? allowedUIDs[i][j] : 0;
+      EEPROM.update(EEPROM_RFID_DATA_ADDR + (i * RFID_UID_SIZE) + j, value);
+    }
+  }
 }
 
 void showRFIDMenu() {
@@ -361,6 +433,7 @@ void checkKeypad() {
 
       newPass[newIndex] = '\0';
       strcpy(password, newPass);
+      savePasswordToEEPROM();
 
       clearLine(1);
       lcd.setCursor(0, 1);
@@ -439,6 +512,7 @@ void checkRFID() {
       delay(1000);
     } else {
       saveCurrentCardAsAllowed();
+      saveRFIDToEEPROM();
       clearLine(1);
       lcd.setCursor(0, 1);
       lcd.print("RFID Added [");
@@ -462,6 +536,7 @@ void checkRFID() {
     int idx = findCardIndex(rfid.uid.uidByte);
     if (idx >= 0) {
       deleteCurrentCard();
+      saveRFIDToEEPROM();
       lcd.print("Deleted [");
       lcd.print(cardCount);
       lcd.print("/5]");
@@ -543,6 +618,8 @@ void checkInsideButton() {
 void setup() {
 
   Serial.begin(9600);
+  loadPasswordFromEEPROM();
+  loadRFIDFromEEPROM();
 
   SPI.begin();
   rfid.PCD_Init();
