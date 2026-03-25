@@ -383,6 +383,7 @@ void closeDoor() {
 
   if (state == SYS_IDLE) return;
 
+  doorServo.attach(SERVO_PIN);
   doorServo.write(LOCK_POS);
   delay(400);
   doorServo.detach();
