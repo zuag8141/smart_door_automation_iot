@@ -622,7 +622,7 @@ void checkKeypad() {
         clearLine(1);
         lcd.setCursor(0, 1);
         lcd.print("Wrong Pass");
-        delay(800);
+        delay(1000);
 
         showPassword();
         resetInput();
@@ -656,8 +656,15 @@ void checkKeypad() {
   } else if (authMode == AUTH_CHANGE_PASS) {
 
     if (isDigit(key) && newIndex < PASS_MAX) {
+
+      if (newIndex == 0) {
+        clearLine(1);
+        lcd.setCursor(0, 1);
+        lcd.print("New Pass: ");
+      }
+
       newPass[newIndex++] = key;
-      lcd.setCursor(PASS_POS + newIndex - 1, 1);
+      lcd.setCursor(10 + newIndex - 1, 1); 
       lcd.print("*");
     }
 
@@ -832,7 +839,7 @@ void checkBluetooth() {
   if (!Serial.available()) return;
 
   String command = Serial.readStringUntil('\n');
-  command.trim(); // bỏ \r, khoảng trắng
+  command.trim();  // bỏ \r, khoảng trắng
 
   if (command.length() == 0) return;
 
@@ -840,8 +847,7 @@ void checkBluetooth() {
     if (state == SYS_AUTH) {
       openDoor();
     }
-  } 
-  else if (command == "SWITCH2_ON" || command == "SWITCH2_OFF") {
+  } else if (command == "SWITCH2_ON" || command == "SWITCH2_OFF") {
     if (state == SYS_DOOR_OPEN) {
       closeDoor();
     }
