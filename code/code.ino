@@ -82,6 +82,8 @@ bool recoveryPendingOtp = false;
 bool recoveryCanSetPass = false;
 char recoveryOtp[7] = "";
 
+bool forceCloseRequested = false;
+
 const byte ROWS = 4;
 const byte COLS = 3;
 
@@ -315,12 +317,12 @@ bool currentCardMatchesAllowed() {
 
 void saveCurrentCardAsAllowed() {
   if (rfid.uid.size < 4) return;
-  
+
   int existingIndex = findCardIndex(rfid.uid.uidByte);
   if (existingIndex >= 0) return;
-  
+
   if (cardCount >= MAX_RFID_CARDS) return;
-  
+
   for (byte i = 0; i < 4; i++) {
     allowedUIDs[cardCount][i] = rfid.uid.uidByte[i];
   }
@@ -329,10 +331,10 @@ void saveCurrentCardAsAllowed() {
 
 void deleteCurrentCard() {
   if (rfid.uid.size < 4 || cardCount == 0) return;
-  
+
   int index = findCardIndex(rfid.uid.uidByte);
   if (index < 0) return;
-  
+
   for (byte i = index; i < cardCount - 1; i++) {
     for (byte j = 0; j < 4; j++) {
       allowedUIDs[i][j] = allowedUIDs[i + 1][j];
@@ -434,12 +436,17 @@ void checkPresence() {
 
 void checkDoorTimer() {
   if (state != SYS_DOOR_OPEN) return;
-  
+
+  if (forceCloseRequested) {
+    closeDoor();
+    forceCloseRequested = false;
+    return;
+  }
+
   if (distance >= PERSON_DISTANCE && millis() - lastSeen > DOOR_TIMEOUT) {
     closeDoor();
   }
 }
-
 void checkKeypad() {
 
   if (state != SYS_AUTH) return;
@@ -738,7 +745,7 @@ void checkRFID() {
   if (authMode == AUTH_RFID_ADD_SCAN) {
 
     int existingIdx = findCardIndex(rfid.uid.uidByte);
-    
+
     if (existingIdx >= 0) {
       clearLine(1);
       lcd.setCursor(0, 1);
@@ -806,7 +813,7 @@ void checkRFID() {
     } else {
 
       clearLine(1);
-      lcd.setCursor(0,1);
+      lcd.setCursor(0, 1);
       lcd.print("Access Denied");
 
       delay(1000);
@@ -822,100 +829,130 @@ void checkRFID() {
 
 void checkBluetooth() {
 
-  if (!Serial.available()) return;
-
   static char command[32];
-  byte idx = 0;
-  while (Serial.available() && idx < sizeof(command) - 1) {
+  static byte idx = 0;
+
+  while (Serial.available()) {
     char c = (char)Serial.read();
-    if (c == '\r' || c == '\n') {
-      if (idx == 0) continue;
-      break;
-    }
-    command[idx++] = c;
-  }
-  command[idx] = '\0';
-  if (idx == 0) return;
-  Serial.println(command);
 
-  if ((recoveryPendingOtp || recoveryCanSetPass) && millis() > recoveryExpiresAt) {
-    clearRecoveryState();
-    showRecoveryNoticeThenRestore("Recovery Timeout", "Try again", 700);
-  }
+    // bỏ qua CR
+    if (c == '\r') continue;
 
-  if (strcmp(command, "OTP_REQ") == 0 || strcmp(command, "OTP_REQUEST") == 0 || strcmp(command, "SEND_OTP") == 0) {
-    if (!recoveryPendingOtp) {
-      return;
-    }
-    if (millis() < recoveryLockoutUntil) {
-      clearRecoveryState();
-      return;
-    }
-    Serial.println(recoveryOtp);
-    return;
-  }
+    // gặp newline -> xử lý command hoàn chỉnh
+    if (c == '\n') {
 
-  if (strncmp(command, "RECOVER_OTP:", 12) == 0) {
-    if (!recoveryPendingOtp) {
-      return;
-    }
+      command[idx] = '\0';
 
-    if (millis() < recoveryLockoutUntil) {
-      clearRecoveryState();
-      return;
-    }
-
-    const char* otp = command + 12;
-    if (strcmp(otp, recoveryOtp) == 0) {
-      recoveryPendingOtp = false;
-      recoveryCanSetPass = true;
-      recoveryExpiresAt = millis() + RECOVERY_WINDOW;
-      recoveryAttempts = 0;
-      showLine0("OTP Verified");
-      clearLine(1);
-      lcd.setCursor(0, 1);
-      lcd.print("Send SET_PASS");
-    } else {
-      recoveryAttempts++;
-      if (recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
-        recoveryLockoutUntil = millis() + RECOVERY_LOCKOUT;
-        clearRecoveryState();
-        showRecoveryNoticeThenRestore("Recovery Locked", "Too many tries", 900);
+      if (idx == 0) {
+        idx = 0;
+        return;
       }
-    }
-    return;
-  }
 
-  if (strncmp(command, "SET_PASS:", 9) == 0) {
-    if (!recoveryCanSetPass || millis() > recoveryExpiresAt) {
-      clearRecoveryState();
+      Serial.println(command);
+
+      // ====== xử lý command ở đây ======
+
+      if ((recoveryPendingOtp || recoveryCanSetPass) && millis() > recoveryExpiresAt) {
+        clearRecoveryState();
+        showRecoveryNoticeThenRestore("Recovery Timeout", "Try again", 700);
+      }
+
+      if (strcmp(command, "OTP_REQ") == 0 || strcmp(command, "OTP_REQUEST") == 0 || strcmp(command, "SEND_OTP") == 0) {
+        if (!recoveryPendingOtp) {
+          idx = 0;
+          return;
+        }
+        if (millis() < recoveryLockoutUntil) {
+          clearRecoveryState();
+          idx = 0;
+          return;
+        }
+        Serial.println(recoveryOtp);
+        idx = 0;
+        return;
+      }
+
+      if (strncmp(command, "RECOVER_OTP:", 12) == 0) {
+        if (!recoveryPendingOtp) {
+          idx = 0;
+          return;
+        }
+
+        if (millis() < recoveryLockoutUntil) {
+          clearRecoveryState();
+          idx = 0;
+          return;
+        }
+
+        const char* otp = command + 12;
+        if (strcmp(otp, recoveryOtp) == 0) {
+          recoveryPendingOtp = false;
+          recoveryCanSetPass = true;
+          recoveryExpiresAt = millis() + RECOVERY_WINDOW;
+          recoveryAttempts = 0;
+          showLine0("OTP Verified");
+          clearLine(1);
+          lcd.setCursor(0, 1);
+          lcd.print("Send SET_PASS");
+        } else {
+          recoveryAttempts++;
+          if (recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
+            recoveryLockoutUntil = millis() + RECOVERY_LOCKOUT;
+            clearRecoveryState();
+            showRecoveryNoticeThenRestore("Recovery Locked", "Too many tries", 900);
+          }
+        }
+        idx = 0;
+        return;
+      }
+
+      if (strncmp(command, "SET_PASS:", 9) == 0) {
+        if (!recoveryCanSetPass || millis() > recoveryExpiresAt) {
+          clearRecoveryState();
+          idx = 0;
+          return;
+        }
+
+        const char* nextPass = command + 9;
+        byte nextPassLen = (byte)strlen(nextPass);
+        if (!isDigitsOnlyCStr(nextPass) || !isValidPassLength(nextPassLen)) {
+          idx = 0;
+          return;
+        }
+
+        strncpy(password, nextPass, sizeof(password) - 1);
+        password[sizeof(password) - 1] = '\0';
+        savePasswordToEEPROM();
+        clearRecoveryState();
+        resetInput();
+        resetNewPass();
+
+        showRecoveryNoticeThenRestore("Pass Recovered", "Saved", 700);
+        idx = 0;
+        return;
+      }
+
+      if (strcmp(command, "SWITCH1_ON") == 0 || strcmp(command, "SWITCH1_OFF") == 0) {
+        if (state == SYS_AUTH) {
+          openDoor();
+        }
+      } else if (strcmp(command, "SWITCH2_ON") == 0 || strcmp(command, "SWITCH2_OFF") == 0) {
+        if (state == SYS_DOOR_OPEN) {
+          closeDoor();
+        }
+      }
+
+      // reset buffer sau khi xử lý
+      idx = 0;
       return;
     }
 
-    const char* nextPass = command + 9;
-    byte nextPassLen = (byte)strlen(nextPass);
-    if (!isDigitsOnlyCStr(nextPass) || !isValidPassLength(nextPassLen)) {
-      return;
-    }
-
-    strncpy(password, nextPass, sizeof(password) - 1);
-    password[sizeof(password) - 1] = '\0';
-    savePasswordToEEPROM();
-    clearRecoveryState();
-    resetInput();
-    resetNewPass();
-
-    showRecoveryNoticeThenRestore("Pass Recovered", "Saved", 700);
-    return;
-  }
-
-  if (strcmp(command, "SWITCH1_ON") == 0 || strcmp(command, "SWITCH1_OFF") == 0) {
-    if (state == SYS_AUTH) {
-      openDoor();
-    }
-  } else if (strcmp(command, "SWITCH2_ON") == 0 || strcmp(command, "SWITCH2_OFF") == 0) {
-    if (state == SYS_DOOR_OPEN) {
-      closeDoor();
+    // lưu ký tự vào buffer
+    if (idx < sizeof(command) - 1) {
+      command[idx++] = c;
+    } else {
+      // overflow thì reset luôn
+      idx = 0;
     }
   }
 }
