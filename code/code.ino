@@ -383,6 +383,7 @@ void closeDoor() {
 
   if (state == SYS_IDLE) return;
 
+  doorServo.attach(SERVO_PIN);
   doorServo.write(LOCK_POS);
   delay(400);
   doorServo.detach();
@@ -835,6 +836,7 @@ void checkBluetooth() {
   }
   command[idx] = '\0';
   if (idx == 0) return;
+  Serial.println(command);
 
   if ((recoveryPendingOtp || recoveryCanSetPass) && millis() > recoveryExpiresAt) {
     clearRecoveryState();
